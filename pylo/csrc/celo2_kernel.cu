@@ -18,15 +18,18 @@
  *   - CELO2MLP stores weights as `(in, out)` and computes `x @ w`, so weights are
  *     indexed in-major: `w[k * out_dim + j]` (k = input idx, j = output idx).
  *   - Momentum `m` is leading-decay `(3,)+shape` => `m[idx + k*n_elements]`.
- *   - `fac_r` (fac_vec_row) and `row_factor` are indexed by the dc-coordinate
- *     (col_idx); `fac_c` (fac_vec_col) and `col_factor` by the dr-coordinate
- *     (row_idx) -- identical convention to AdafacLO's populate_vector_inp.
+ *   - Factored buffers keep every parameter coordinate except their reduced
+ *     axis, with a leading decay axis. Their strides include the residual
+ *     coordinates of higher-rank parameters.
+ *   - Feature moments reduce over the final two parameter dimensions, retaining
+ *     every leading prefix, exactly as the trailing-channel Python features do.
  */
 
 #include <torch/torch.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #define BLOCK_SIZE 256
 #define NUM_DECAYS 3
@@ -64,8 +67,14 @@ __device__ void populate_celo2_features(
     const int n_elements,
     const int vector_like)
 {
-    const int row_idx = vector_like ? idx : (idx / row_stride) % num_rows;
-    const int col_idx = vector_like ? idx : (idx / col_stride) % num_cols;
+    // Remove one coordinate from the logical contiguous parameter index. The
+    // remaining coordinates, including spatial ones, still address the factor.
+    const int r_idx = vector_like ? idx
+        : (idx / (row_stride * num_rows)) * row_stride + idx % row_stride;
+    const int c_idx = vector_like ? idx
+        : (idx / (col_stride * num_cols)) * col_stride + idx % col_stride;
+    const int r_elements = vector_like ? n_elements : n_elements / num_rows;
+    const int c_elements = vector_like ? n_elements : n_elements / num_cols;
 
     const float gv = static_cast<float>(g[idx]);
     const float pv = static_cast<float>(p[idx]);
@@ -75,13 +84,12 @@ __device__ void populate_celo2_features(
     const float rms = static_cast<float>(v[idx]);
     const float rs = __frsqrt_rn(rms + FEAT_EPS);
 
-    // row_factor / fac_r are indexed by col_idx; col_factor / fac_c by row_idx.
-    const float rf0 = static_cast<float>(row_factor[col_idx]);
-    const float rf1 = static_cast<float>(row_factor[col_idx + num_cols]);
-    const float rf2 = static_cast<float>(row_factor[col_idx + 2 * num_cols]);
-    const float cf0 = vector_like ? 1.0f : static_cast<float>(col_factor[row_idx]);
-    const float cf1 = vector_like ? 1.0f : static_cast<float>(col_factor[row_idx + num_rows]);
-    const float cf2 = vector_like ? 1.0f : static_cast<float>(col_factor[row_idx + 2 * num_rows]);
+    const float rf0 = static_cast<float>(row_factor[r_idx]);
+    const float rf1 = static_cast<float>(row_factor[r_idx + r_elements]);
+    const float rf2 = static_cast<float>(row_factor[r_idx + 2 * r_elements]);
+    const float cf0 = vector_like ? 1.0f : static_cast<float>(col_factor[c_idx]);
+    const float cf1 = vector_like ? 1.0f : static_cast<float>(col_factor[c_idx + c_elements]);
+    const float cf2 = vector_like ? 1.0f : static_cast<float>(col_factor[c_idx + 2 * c_elements]);
 
     // Groups 0-8 (15 channels): always present.
     f[0] = gv;                                   // g
@@ -104,12 +112,12 @@ __device__ void populate_celo2_features(
     }
 
     // Groups 9-13 (channels 15-29): factored features for 2D+ params.
-    const float vr0 = static_cast<float>(fac_r[col_idx]);
-    const float vr1 = static_cast<float>(fac_r[col_idx + num_cols]);
-    const float vr2 = static_cast<float>(fac_r[col_idx + 2 * num_cols]);
-    const float vc0 = static_cast<float>(fac_c[row_idx]);
-    const float vc1 = static_cast<float>(fac_c[row_idx + num_rows]);
-    const float vc2 = static_cast<float>(fac_c[row_idx + 2 * num_rows]);
+    const float vr0 = static_cast<float>(fac_r[r_idx]);
+    const float vr1 = static_cast<float>(fac_r[r_idx + r_elements]);
+    const float vr2 = static_cast<float>(fac_r[r_idx + 2 * r_elements]);
+    const float vc0 = static_cast<float>(fac_c[c_idx]);
+    const float vc1 = static_cast<float>(fac_c[c_idx + c_elements]);
+    const float vc2 = static_cast<float>(fac_c[c_idx + 2 * c_elements]);
 
     f[15] = vr0; f[16] = vr1; f[17] = vr2;       // row_feat (v_row)
     f[18] = vc0; f[19] = vc1; f[20] = vc2;       // col_feat (v_col)
@@ -124,8 +132,9 @@ __device__ void populate_celo2_features(
     f[29] = m2 * rf2 * cf2;
 }
 
-// Pass 1: accumulate sum of squares of each of the 30 feature channels across
-// all elements into second_moment[30].
+// Pass 1: accumulate each feature channel over the final two parameter axes.
+// Every block belongs to one prefix group; even its warp/block reductions can
+// therefore never mix groups smaller than a warp or a block.
 template <typename T>
 __global__ void celo2_moment_kernel(
     const T *__restrict__ g,
@@ -138,6 +147,8 @@ __global__ void celo2_moment_kernel(
     const T *__restrict__ col_factor,
     float *__restrict__ second_moment,
     const int n_elements,
+    const int group_elements,
+    const int blocks_per_group,
     const int num_rows,
     const int num_cols,
     const int row_stride,
@@ -148,6 +159,8 @@ __global__ void celo2_moment_kernel(
     const int warp_id = tid / warpSize;
     const int lane_id = tid % warpSize;
     const int num_warps = blockDim.x / warpSize;
+    const int group = blockIdx.x / blocks_per_group;
+    const int tile = blockIdx.x % blocks_per_group;
     __shared__ float s_warp_results[BLOCK_SIZE / 32][INPUT_DIM];
 
     if (tid < num_warps * INPUT_DIM)
@@ -160,8 +173,10 @@ __global__ void celo2_moment_kernel(
 
     float thread_accum[INPUT_DIM] = {0};
 
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_elements; i += blockDim.x * gridDim.x)
+    for (int local = tile * blockDim.x + threadIdx.x; local < group_elements;
+         local += blockDim.x * blocks_per_group)
     {
+        const int i = group * group_elements + local;
         float f[INPUT_DIM];
         populate_celo2_features<T>(f, g, p, m, v, fac_r, fac_c, row_factor, col_factor,
                                    i, num_rows, num_cols, row_stride, col_stride,
@@ -193,7 +208,7 @@ __global__ void celo2_moment_kernel(
             for (int offset = warpSize / 2; offset > 0; offset /= 2)
                 sum += __shfl_down_sync(0xffffffff, sum, offset);
             if (lane_id == 0)
-                atomicAdd(&second_moment[j], sum);
+                atomicAdd(&second_moment[group * INPUT_DIM + j], sum);
         }
     }
 }
@@ -219,6 +234,8 @@ __global__ void celo2_apply_kernel(
     const T *__restrict__ b_out,  // (OUTPUT_DIM,)
     T *__restrict__ step_out,
     const int n_elements,
+    const int group_elements,
+    const int blocks_per_group,
     const int num_rows,
     const int num_cols,
     const int row_stride,
@@ -227,14 +244,18 @@ __global__ void celo2_apply_kernel(
     const int vector_like)
 {
     const int tid = threadIdx.x;
+    const int group = blockIdx.x / blocks_per_group;
+    const int tile = blockIdx.x % blocks_per_group;
     __shared__ float s_norm[INPUT_DIM];
 
     if (tid < INPUT_DIM)
-        s_norm[tid] = rsqrtf(second_moment[tid] / n_elements + NORM_EPS);
+        s_norm[tid] = rsqrtf(second_moment[group * INPUT_DIM + tid] / group_elements + NORM_EPS);
     __syncthreads();
 
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_elements; i += blockDim.x * gridDim.x)
+    for (int local = tile * blockDim.x + threadIdx.x; local < group_elements;
+         local += blockDim.x * blocks_per_group)
     {
+        const int i = group * group_elements + local;
         float f[INPUT_DIM];
         populate_celo2_features<T>(f, g, p, m, v, fac_r, fac_c, row_factor, col_factor,
                                    i, num_rows, num_cols, row_stride, col_stride,
@@ -303,16 +324,26 @@ void celo2_kernel(
     const int dr,
     const int vector_like)
 {
+    const c10::cuda::CUDAGuard device_guard(p.device());
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(p.get_device());
     const int n_elements = p.numel();
     const int num_rows = vector_like ? n_elements : p.size(dr);
     const int num_cols = vector_like ? n_elements : p.size(dc);
     const int row_stride = vector_like ? 1 : p.stride(dr);
     const int col_stride = vector_like ? 1 : p.stride(dc);
-    const int blocks_needed = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    const int blocks = min(blocks_needed, 1728);
+    const int group_elements = vector_like ? n_elements : p.size(-2) * p.size(-1);
+    const int groups = n_elements / group_elements;
+    const int blocks_needed = (group_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blocks_per_group = min(blocks_needed, 1728);
+    const int blocks = groups * blocks_per_group;
+    // Both public Python callers supply their original 30-float scratch. Keep
+    // that argument/API, and allocate the additional prefix groups internally.
+    // Zeros and both launches share the guarded device's current stream; this
+    // local tensor stays alive until both asynchronous launches are enqueued.
+    auto grouped_second_moment = at::zeros({groups, INPUT_DIM}, second_moment.options());
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(p.scalar_type(), "celo2_moment_kernel", ([&] {
-        celo2_moment_kernel<scalar_t><<<blocks, BLOCK_SIZE>>>(
+        celo2_moment_kernel<scalar_t><<<blocks, BLOCK_SIZE, 0, stream>>>(
             g.data_ptr<scalar_t>(),
             p.data_ptr<scalar_t>(),
             m.data_ptr<scalar_t>(),
@@ -321,12 +352,13 @@ void celo2_kernel(
             fac_c.data_ptr<scalar_t>(),
             row_factor.data_ptr<scalar_t>(),
             col_factor.data_ptr<scalar_t>(),
-            second_moment.data_ptr<float>(),
-            n_elements, num_rows, num_cols, row_stride, col_stride, vector_like);
+            grouped_second_moment.data_ptr<float>(),
+            n_elements, group_elements, blocks_per_group,
+            num_rows, num_cols, row_stride, col_stride, vector_like);
     }));
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(p.scalar_type(), "celo2_apply_kernel", ([&] {
-        celo2_apply_kernel<scalar_t><<<blocks, BLOCK_SIZE>>>(
+        celo2_apply_kernel<scalar_t><<<blocks, BLOCK_SIZE, 0, stream>>>(
             g.data_ptr<scalar_t>(),
             p.data_ptr<scalar_t>(),
             m.data_ptr<scalar_t>(),
@@ -335,7 +367,7 @@ void celo2_kernel(
             fac_c.data_ptr<scalar_t>(),
             row_factor.data_ptr<scalar_t>(),
             col_factor.data_ptr<scalar_t>(),
-            second_moment.data_ptr<float>(),
+            grouped_second_moment.data_ptr<float>(),
             w_in.data_ptr<scalar_t>(),
             b_in.data_ptr<scalar_t>(),
             w_h.data_ptr<scalar_t>(),
@@ -343,7 +375,8 @@ void celo2_kernel(
             w_out.data_ptr<scalar_t>(),
             b_out.data_ptr<scalar_t>(),
             step_out.data_ptr<scalar_t>(),
-            n_elements, num_rows, num_cols, row_stride, col_stride, exp_mult, vector_like);
+            n_elements, group_elements, blocks_per_group,
+            num_rows, num_cols, row_stride, col_stride, exp_mult, vector_like);
     }));
 
     AT_CUDA_CHECK(cudaGetLastError());
